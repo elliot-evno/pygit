@@ -159,9 +159,13 @@ class PyGit:
     def _update_working_directory(self, commit_sha):
         """Update the working directory to match the given commit"""
         # Get the commit object
-        _, commit_data = self.objects.get_object(commit_sha, 'commit')
-        commit_lines = commit_data.decode().split('\n')
-        
+        try:
+            _, commit_data = self.objects.get_object(commit_sha, 'commit')
+            commit_lines = commit_data.decode('utf-8', errors='replace').split('\n')
+        except Exception as e:
+            print(f"Error reading commit {commit_sha}: {e}")
+            return
+
         # Get the root tree SHA
         tree_sha = None
         for line in commit_lines:
@@ -170,14 +174,18 @@ class PyGit:
                 break
         
         if not tree_sha:
-            raise Exception("Invalid commit: no tree found")
+            print("Invalid commit: no tree found")
+            return
         
         # Clear tracked files that might have changed
         index = self.index._load_index()
         for path in index:
             abs_path = os.path.join(self.root_path, path)
             if os.path.exists(abs_path) and not os.path.isdir(abs_path):
-                os.remove(abs_path)
+                try:
+                    os.remove(abs_path)
+                except Exception as e:
+                    print(f"Warning: Could not remove file {path}: {e}")
         
         # New index for the checked-out state
         new_index = {}
@@ -190,47 +198,64 @@ class PyGit:
     
     def _populate_working_dir(self, prefix, tree_sha, index):
         """Recursively populate the working directory from a tree object"""
-        _, tree_data = self.objects.get_object(tree_sha, 'tree')
-        tree_content = tree_data.decode().split('\n')
-        
-        for line in tree_content:
-            if not line:
-                continue
+        try:
+            _, tree_data = self.objects.get_object(tree_sha, 'tree')
+            # Process binary tree data instead of decoding to text
+            ptr = 0
+            while ptr < len(tree_data):
+                # Find the next null byte which separates the mode/name from the SHA
+                null_pos = tree_data.find(b'\x00', ptr)
+                if null_pos == -1:
+                    break
                 
-            # Parse the tree entry (mode type sha name)
-            parts = line.split()
-            if len(parts) < 3:
-                continue
+                # Parse mode and filename from the header
+                header = tree_data[ptr:null_pos]
+                space_pos = header.find(b' ')
+                if space_pos == -1:
+                    ptr = null_pos + 21
+                    continue
                 
-            mode = parts[0]
-            obj_type = parts[1]
-            obj_sha = parts[2]
-            name = ' '.join(parts[3:]).strip()
-            
-            # Handle the entry based on its type
-            if obj_type == 'blob':
-                # It's a file
-                file_path = os.path.join(prefix, name) if prefix else name
-                abs_path = os.path.join(self.root_path, file_path)
+                mode = header[:space_pos].decode('utf-8')
+                name = header[space_pos+1:].decode('utf-8', errors='replace')
+                obj_sha = tree_data[null_pos+1:null_pos+21].hex()
                 
-                # Create parent directories if needed
-                os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-                
-                # Get the file content and write it
-                _, blob_data = self.objects.get_object(obj_sha, 'blob')
-                with open(abs_path, 'wb') as f:
-                    f.write(blob_data)
+                # Handle the entry based on its type (determined by mode)
+                if mode.startswith('10'):
+                    # Regular file (blob)
+                    file_path = os.path.join(prefix, name) if prefix else name
+                    abs_path = os.path.join(self.root_path, file_path)
                     
-                # Update the index
-                stat = os.stat(abs_path)
-                index[file_path] = {
-                    'sha1': obj_sha,
-                    'mtime': stat.st_mtime,
-                    'size': stat.st_size,
-                    'mode': stat.st_mode
-                }
+                    # Create parent directories if needed
+                    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+                    
+                    # Get the file content and write it
+                    try:
+                        _, blob_data = self.objects.get_object(obj_sha, 'blob')
+                        
+                        # Write the file with correct permissions
+                        mode_int = int(mode, 8)
+                        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                        fd = os.open(abs_path, flags, mode_int)
+                        with os.fdopen(fd, 'wb') as f:
+                            f.write(blob_data)
+                            
+                        # Update the index
+                        stat = os.stat(abs_path)
+                        index[file_path] = {
+                            'sha1': obj_sha,
+                            'mtime': stat.st_mtime,
+                            'size': stat.st_size,
+                            'mode': stat.st_mode
+                        }
+                    except Exception as e:
+                        print(f"Error processing blob {obj_sha} at {file_path}: {e}")
                 
-            elif obj_type == 'tree':
-                # It's a directory, recursively process it
-                new_prefix = os.path.join(prefix, name) if prefix else name
-                self._populate_working_dir(new_prefix, obj_sha, index)  
+                elif mode.startswith('40'):
+                    # Directory (tree)
+                    new_prefix = os.path.join(prefix, name) if prefix else name
+                    self._populate_working_dir(new_prefix, obj_sha, index)
+                
+                ptr = null_pos + 21  # Move to next entry (20-byte SHA + 1-byte null)
+        
+        except Exception as e:
+            print(f"Error processing tree {tree_sha}: {e}")

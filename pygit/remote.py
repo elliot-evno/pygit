@@ -209,18 +209,61 @@ class PyGitRemote:
                 
                 # Get response
                 response = b""
-                while True:
-                    chunk = s.recv(8192)
+                
+                # First, read the 4-byte length header
+                length_data = b""
+                while len(length_data) < 4:
+                    chunk = s.recv(4 - len(length_data))
                     if not chunk:
                         break
-                    response += chunk
+                    length_data += chunk
                 
-                response_data = json.loads(response.decode())
+                if len(length_data) < 4:
+                    print("Error: Incomplete length header received")
+                    return
+                
+                # Convert length to integer
+                json_length = int.from_bytes(length_data, 'big')
+                
+                # Read the JSON data
+                json_data = b""
+                while len(json_data) < json_length:
+                    chunk = s.recv(min(4096, json_length - len(json_data)))
+                    if not chunk:
+                        break
+                    json_data += chunk
+                
+                if len(json_data) < json_length:
+                    print("Error: Incomplete JSON data received")
+                    return
+                
+                # Parse JSON
+                response_data = json.loads(json_data.decode('utf-8'))
+                
+                # Read the binary data
+                binary_data = b""
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    binary_data += chunk
+                
+                # If there are objects in the response, process them
+                if 'objects' in response_data and binary_data:
+                    try:
+                        # Decompress the binary data
+                        decoded_objects = zlib.decompress(binary_data)
+                        objects_dict = json.loads(decoded_objects.decode('utf-8'))
+                        response_data['objects'] = objects_dict
+                    except Exception as e:
+                        print(f"Error processing binary objects: {e}")
+                        return
                 
                 if not response_data.get('success'):
                     print(f"Pull failed: {response_data.get('error', 'Unknown error')}")
                     return
                 
+                # Process objects
                 print(f"Received {len(response_data.get('objects', {}))} objects from remote")
                 for sha, obj_data in response_data.get('objects', {}).items():
                     print(f"Processing object {sha} ({len(obj_data)} bytes)")
@@ -237,36 +280,17 @@ class PyGitRemote:
                             print(f"Warning: Empty object data for {sha}")
                             continue
                             
-                        # Debug: Print first 20 bytes of decoded data
-                        print(f"Decoded data (first 20 bytes): {decoded_data[:20]}")
-                        
-                        # Compress the data before storing (this is the key change)
-                        compressed_data = zlib.compress(decoded_data)
-                        
                         # Write object to disk
                         object_path = os.path.join(self.pygit.objects_dir, sha[:2], sha[2:])
                         os.makedirs(os.path.dirname(object_path), exist_ok=True)
                         
                         with open(object_path, 'wb') as f:
-                            f.write(compressed_data)
+                            f.write(decoded_data)
                             
                         print(f"Successfully wrote object {sha}")
                         
-                        # Try to read the object back to verify it
-                        try:
-                            with open(object_path, 'rb') as f:
-                                read_data = f.read()
-                                print(f"Read back data (first 20 bytes): {read_data[:20]}")
-                                
-                                # Try to decompress it to verify it works
-                                decompressed = zlib.decompress(read_data)
-                                print(f"Decompression successful: {decompressed[:20]}")
-                        except Exception as e:
-                            print(f"Error reading back object {sha}: {str(e)}")
-                        
                     except Exception as e:
                         print(f"Error processing object {sha}: {str(e)}")
-                        print(f"Object data: {obj_data[:100]}...")  # Print first 100 chars of base64 data
                         continue
                 
                 # Update local branch
